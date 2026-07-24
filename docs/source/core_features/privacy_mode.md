@@ -38,6 +38,7 @@ analyzer -> detector -> sanitizer -> leakage_adversary -> (HITL gate) -> answer 
 - `context_analyzer.llm`: the analyzer's LLM. The detector, sanitizer, adversary, and verifier fall back to it when they don't set their own.
 - `interactive`: the HITL gate. In `local` mode it prompts in the terminal (queries run one at a time); in `api` mode it auto-approves with a warning. Set `false` for unattended runs.
 - `detection.engine`: one engine, either `presidio`, `gliner`, `llm`, or `openai_filter`.
+  When using `presidio`, MMORE relies on spaCy's `en_core_web_lg` model; if it is missing, the Presidio engine may download it on first use.
 - `sanitization.strategy`: `token_masking`, `entity_replacement`, `synthetic_rewrite`, or `presidio`.
 - `sanitization.encryption_key`: AES key used when the `presidio` strategy runs its `encrypt` operator (e.g. after gate feedback asks for encryption). Unlike masking or hashing, encryption is reversible: whoever holds this key can decrypt the values in the sanitized context later. Without it a random key is generated per run and discarded, so the encrypted values are as unrecoverable as a hash.
 - `leakage_adversary.strategies`: which attack vectors the adversary probes. Omit to run all (`residual_span`, `quasi_identifier`, `structural_reid`, `context_reconstruction`, `membership_inference`). Pass a subset (e.g. `[residual_span, quasi_identifier]`) to narrow and speed up the probe.
