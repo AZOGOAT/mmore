@@ -14,7 +14,7 @@ import logging
 import os
 import threading
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Callable, NamedTuple, Optional, TypeVar, Union, cast
+from typing import TYPE_CHECKING, Callable, NamedTuple, TypeVar, Union, cast
 
 if TYPE_CHECKING:
     from faker import Faker
@@ -66,7 +66,7 @@ def _empty_device_cache() -> None:
         torch.cuda.empty_cache()
 
 
-def _device_total_bytes() -> Optional[int]:
+def _device_total_bytes() -> int | None:
     """Total memory of the active device."""
     import torch
 
@@ -91,16 +91,16 @@ class _Entry(NamedTuple):
 class ModelRegistry:
     """Thread-safe LRU cache of loaded models shared across privacy engines."""
 
-    def __init__(self, budget_mb: Optional[float] = None, enabled: bool = True) -> None:
+    def __init__(self, budget_mb: float | None = None, enabled: bool = True) -> None:
         self._enabled = enabled
         self._budget_mb = budget_mb
-        self._budget_bytes: Optional[int] = None
+        self._budget_bytes: int | None = None
         self._budget_ready = False
         self._entries: OrderedDict[str, _Entry] = OrderedDict()
         self._total = 0
         self._lock = threading.RLock()
 
-    def _budget(self) -> Optional[int]:
+    def _budget(self) -> int | None:
         """Resolve the byte budget once, auto-detecting device memory if unset."""
         if not self._budget_ready:
             if self._budget_mb is None:
@@ -152,7 +152,7 @@ class ModelRegistry:
                 "Model %r alone exceeds the model budget; keeping it resident", protect
             )
 
-    def clear(self, prefix: Optional[str] = None) -> None:
+    def clear(self, prefix: str | None = None) -> None:
         """Drop cached models whose key starts with ``prefix`` (all if ``None``)."""
         if not self._enabled:
             return
@@ -169,7 +169,7 @@ class ModelRegistry:
                 _empty_device_cache()
 
 
-def _default_budget_mb() -> Optional[float]:
+def _default_budget_mb() -> float | None:
     raw = os.environ.get(_BUDGET_ENV)
     if not raw:
         return None

@@ -4,25 +4,19 @@ Emitted by the VerifierAgent after checking the model's answer against
 the whole context (raw + sanitized). It never re-triggers an escalation.
 """
 
+from collections import Counter
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import List, Optional
 
-
-class WarningKind(str, Enum):
-    """The advisory check that raised a warning."""
-
-    RESIDUAL_LEAKAGE = "residual_leakage"
-    FAITHFULNESS = "faithfulness"
+from ..config import VerifierCheck
 
 
 @dataclass
 class VerifierWarning:
     """One advisory finding from a single check over the answer."""
 
-    kind: WarningKind
+    kind: VerifierCheck
     # entity type (if residual leakage) or short unsupported claim (if faithfulness)
-    flagged: Optional[str]
+    flagged: str | None
     evidence: str
     confidence: float
 
@@ -31,9 +25,9 @@ class VerifierWarning:
 class VerifierVerdict:
     """Aggregate advisory verdict: the warnings raised across all checks."""
 
-    warnings: List[VerifierWarning] = field(default_factory=list)
-    checks_run: List[str] = field(default_factory=list)
-    checks_failed: List[str] = field(default_factory=list)
+    warnings: list[VerifierWarning] = field(default_factory=list)
+    checks_run: list[str] = field(default_factory=list)
+    checks_failed: list[str] = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
@@ -43,9 +37,7 @@ class VerifierVerdict:
     def summary(self) -> str:
         if not self.warnings:
             return "clean"
-        counts = {}
-        for w in self.warnings:
-            counts[w.kind.value] = counts.get(w.kind.value, 0) + 1
+        counts = Counter(w.kind.value for w in self.warnings)
         breakdown = ", ".join(f"{kind}: {n}" for kind, n in sorted(counts.items()))
         return f"{len(self.warnings)} warning(s) ({breakdown})"
 
