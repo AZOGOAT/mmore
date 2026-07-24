@@ -1,6 +1,6 @@
 <h1 align="center">
 
-![image](https://raw.githubusercontent.com/EPFLiGHT/mmore/master/mmore_logo.jpg)
+![image](https://raw.githubusercontent.com/EPFLiGHT/mmore/main/mmore_logo.jpg)
 
 </h1>
 
