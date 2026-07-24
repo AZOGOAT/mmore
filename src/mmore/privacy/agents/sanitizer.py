@@ -19,6 +19,7 @@ from ...rag.llm import LLMConfig
 from ...utils import load_config
 from ..config import PrivacyConfig
 from ..detection.base import PIISpan
+from ..detection.constants import DEFAULT_LLM_CONFIG
 from ..dspy_llm import build_dspy_lm
 from ..policy import PrivacyPolicy
 from ..sanitization.constants import SANITIZATION_TOOL_NAMES
@@ -79,13 +80,20 @@ class SanitizerAgent(BaseAgent):
         if not isinstance(config, PrivacyConfig):
             config = load_config(config, PrivacyConfig)
         llm_config = config.sanitization.llm if config.sanitization else None
+        if llm_config is None and config.context_analyzer:
+            llm_config = config.context_analyzer.llm
         return cls(config, llm_config, checkpointer=checkpointer)
 
     def _ensure_dspy_lm(self) -> dspy.BaseLM:
         """Lazily build the DSPy LM when sanitization method requires an LLM."""
         if self._dspy_lm is None:
             if self._llm_config is None:
-                raise ValueError("Sanitizer strategy requires an LLM.")
+                logger.warning(
+                    "No sanitization or analyzer LLM configured, falling back "
+                    "to default LLM %r",
+                    DEFAULT_LLM_CONFIG.llm_name,
+                )
+                self._llm_config = DEFAULT_LLM_CONFIG
             self._dspy_lm = build_dspy_lm(self._llm_config)
         return self._dspy_lm
 
@@ -114,4 +122,7 @@ class SanitizerAgent(BaseAgent):
                 f"spans/raw_chunks length mismatch: {len(spans_per_chunk)} != {len(chunks)}"
             )
         sanitized = self.sanitize(policy, chunks, spans_per_chunk)
-        return PrivacyState(sanitized_chunks=sanitized)
+        query = state.get("query", "")
+        query_spans = list(state.get("query_spans") or [])
+        sanitized_query = self.sanitize(policy, [query], [query_spans])[0]
+        return PrivacyState(sanitized_chunks=sanitized, sanitized_query=sanitized_query)

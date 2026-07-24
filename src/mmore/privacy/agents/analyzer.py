@@ -11,6 +11,7 @@ the per-request PrivacyPolicy the next agents consume.
 
 import logging
 import re
+import secrets
 from dataclasses import asdict, replace
 from typing import Dict, List, Literal, Optional, Union
 
@@ -29,11 +30,16 @@ from ..detection.constants import (
     THRESHOLD_LEVELS,
 )
 from ..domains.profile import DOMAIN_PROFILES, get_domain_profile
-from ..dspy_llm import build_dspy_lm
+from ..dspy_llm import TolerantJSONAdapter, build_dspy_lm
 from ..escalation import apply_entity_guidance
 from ..leakage import EscalationRecord
 from ..policy import PrivacyPolicy
-from ..sanitization.constants import SANITIZATION_GUIDANCE, SANITIZATION_TOOL_NAMES
+from ..sanitization.constants import (
+    PRESIDIO_OPERATOR_GUIDANCE,
+    SANITIZATION_GUIDANCE,
+    SANITIZATION_TOOL_NAMES,
+)
+from ..ux import report_notice
 from .base import BaseAgent
 from .registry import tool_registry
 from .state import PreCloudOutcome, PrivacyState
@@ -83,10 +89,18 @@ _FEEDBACK_LABEL_EXPAND_INSTRUCTION = (
 _FEEDBACK_POLICY_INSTRUCTION = (
     "A reviewer (the human at the gate or the leakage adversary) gave the "
     "feedback below. Decide whether it calls for a different detection engine, "
-    "sanitization strategy, or detection threshold level, either by naming one "
+    "sanitization strategy, detection threshold level, presidio anonymization "
+    "operator, or a custom rewrite instruction, either by naming one "
     "explicitly or by describing what they want (use the guidance to map the "
-    "description to the best fitting option). Return the chosen value from the "
-    "available options, or 'keep' for a field the feedback does not affect."
+    "description to the best fitting option). When the feedback describes an "
+    "anonymization technique (masking characters, hashing, encryption), choose "
+    "the presidio strategy and the matching operator. When it describes how "
+    "the sanitized text should read, choose synthetic_rewrite and distill a "
+    "short rewrite instruction. When it describes what or how to detect (e.g. "
+    "treat certain terms or patterns as sensitive), choose the llm engine and "
+    "distill a short detection instruction. Return the chosen value from the "
+    "available options, 'keep' for a field the feedback does not affect, and "
+    "'none' for no rewrite or detection instruction."
 )
 
 
@@ -119,6 +133,20 @@ _REQUESTED_STRATEGY_DESC = (
 )
 _REQUESTED_THRESHOLD_DESC = (
     "one of: low, medium, high, or 'keep' to leave the detection threshold unchanged"
+)
+_OPERATOR_GUIDANCE_DESC = (
+    "per-operator guidance: what each presidio anonymization operator does"
+)
+_REQUESTED_OPERATOR_DESC = (
+    "one of the presidio operators, or 'keep' to leave anonymization unchanged"
+)
+_REWRITE_INSTRUCTION_DESC = (
+    "concise PII-free instruction for the rewrite LLM distilled from the "
+    "feedback, or 'none'"
+)
+_DETECTION_INSTRUCTION_DESC = (
+    "concise PII-free instruction for the LLM detector distilled from the "
+    "feedback, or 'none'"
 )
 
 _MAX_ADDITIONAL_ENTITIES = 8
@@ -166,11 +194,15 @@ class _FeedbackPolicySignature(dspy.Signature):
     feedback: str = dspy.InputField(desc=_FEEDBACK_DESC)
     engine_guidance: str = dspy.InputField(desc=_DETECTION_GUIDANCE_DESC)
     strategy_guidance: str = dspy.InputField(desc=_STRATEGY_GUIDANCE_DESC)
+    operator_guidance: str = dspy.InputField(desc=_OPERATOR_GUIDANCE_DESC)
     available_engines: List[str] = dspy.InputField(desc=_AVAILABLE_ENGINES_DESC)
     available_strategies: List[str] = dspy.InputField(desc=_AVAILABLE_STRATEGIES_DESC)
     requested_engine: str = dspy.OutputField(desc=_REQUESTED_ENGINE_DESC)
     requested_strategy: str = dspy.OutputField(desc=_REQUESTED_STRATEGY_DESC)
     requested_threshold: str = dspy.OutputField(desc=_REQUESTED_THRESHOLD_DESC)
+    requested_operator: str = dspy.OutputField(desc=_REQUESTED_OPERATOR_DESC)
+    rewrite_instruction: str = dspy.OutputField(desc=_REWRITE_INSTRUCTION_DESC)
+    detection_instruction: str = dspy.OutputField(desc=_DETECTION_INSTRUCTION_DESC)
 
 
 class _PresidioParamsSignature(dspy.Signature):
@@ -287,20 +319,28 @@ def _build_param_predictor(engine: str) -> dspy.Predict | None:
 
 
 def _describe_policy_changes(old: PrivacyPolicy, new: PrivacyPolicy) -> str:
-    """Short escalation-log label for what the guidance actually changed."""
+    """Short, human-readable label for what the guidance actually changed."""
     changes: List[str] = []
     if new.detection_engine != old.detection_engine:
-        changes.append(f"engine->{new.detection_engine}")
+        changes.append(f"detecting with {new.detection_engine}")
     if new.sanitization_strategy != old.sanitization_strategy:
-        changes.append(f"strategy->{new.sanitization_strategy}")
+        changes.append(f"sanitizing with {new.sanitization_strategy}")
     old_threshold = old.detection_params.get("confidence_threshold")
     new_threshold = new.detection_params.get("confidence_threshold")
     if new_threshold != old_threshold:
-        changes.append(f"threshold->{new_threshold}")
+        changes.append(f"detection threshold {new_threshold}")
+    old_operator = old.sanitization_params.get("operator")
+    new_operator = new.sanitization_params.get("operator")
+    if new_operator != old_operator:
+        changes.append(f"{new_operator} operator")
+    if new.sanitizer_system_prompt != old.sanitizer_system_prompt:
+        changes.append("new rewrite instruction")
+    if new.detector_system_prompt != old.detector_system_prompt:
+        changes.append("new detection instruction")
     added_labels = len(new.sensitive_entities) - len(old.sensitive_entities)
     if added_labels:
-        changes.append(f"+{added_labels}_labels")
-    return " ".join(changes) if changes else "note_only"
+        changes.append(f"{added_labels} more entity labels")
+    return ", ".join(changes) if changes else "same policy, stricter guidance"
 
 
 def _format_engine_guidance() -> str:
@@ -311,6 +351,32 @@ def _format_strategy_guidance() -> str:
     return "\n".join(
         f"- {name}: {desc}" for name, desc in SANITIZATION_GUIDANCE.items()
     )
+
+
+def _format_operator_guidance() -> str:
+    return "\n".join(
+        f"- {name}: {desc}" for name, desc in PRESIDIO_OPERATOR_GUIDANCE.items()
+    )
+
+
+def _detection_unchanged(old: PrivacyPolicy, new: PrivacyPolicy) -> bool:
+    """True when the escalation left every detection-relevant field untouched."""
+    return (
+        new.detection_engine == old.detection_engine
+        and new.detection_params == old.detection_params
+        and new.detector_system_prompt == old.detector_system_prompt
+        and set(new.sensitive_entities) == set(old.sensitive_entities)
+    )
+
+
+def _pin_rewrite_instruction(prompt: str, instruction: str) -> str:
+    """Append the reviewer's rewrite instruction to the prompt, idempotently."""
+    if not instruction or instruction.lower() in ("none", "keep"):
+        return prompt
+    note = f"Reviewer instruction: {instruction}"
+    if note in prompt:
+        return prompt
+    return f"{prompt} {note}".strip()
 
 
 def _parse_param_prediction(
@@ -429,7 +495,7 @@ class ContextPolicyAnalyzerAgent(BaseAgent):
         self._ensure_dspy_lm()
         predictor = _build_label_expansion_predictor()
         try:
-            with dspy.context(lm=self._dspy_lm, adapter=dspy.JSONAdapter()):
+            with dspy.context(lm=self._dspy_lm, adapter=TolerantJSONAdapter()):
                 prediction = predictor(
                     query=query,
                     context="\n\n".join(chunks),
@@ -454,7 +520,7 @@ class ContextPolicyAnalyzerAgent(BaseAgent):
         self._ensure_dspy_lm()
         predictor = _build_feedback_label_expansion_predictor()
         try:
-            with dspy.context(lm=self._dspy_lm, adapter=dspy.JSONAdapter()):
+            with dspy.context(lm=self._dspy_lm, adapter=TolerantJSONAdapter()):
                 prediction = predictor(
                     query=state.get("query", ""),
                     context="\n\n".join(state.get("raw_chunks", [])),
@@ -482,6 +548,7 @@ class ContextPolicyAnalyzerAgent(BaseAgent):
                     feedback=feedback,
                     engine_guidance=_format_engine_guidance(),
                     strategy_guidance=_format_strategy_guidance(),
+                    operator_guidance=_format_operator_guidance(),
                     available_engines=list(DETECTION_TOOL_NAMES),
                     available_strategies=list(SANITIZATION_TOOL_NAMES),
                 )
@@ -491,6 +558,11 @@ class ContextPolicyAnalyzerAgent(BaseAgent):
         engine = str(getattr(prediction, "requested_engine", "")).strip().lower()
         strategy = str(getattr(prediction, "requested_strategy", "")).strip().lower()
         threshold = str(getattr(prediction, "requested_threshold", "")).strip().lower()
+        operator = str(getattr(prediction, "requested_operator", "")).strip().lower()
+        instruction = str(getattr(prediction, "rewrite_instruction", "")).strip()
+        detection_instruction = str(
+            getattr(prediction, "detection_instruction", "")
+        ).strip()
         engine_pinned = respect_config_pins and self.config.detection.engine
         strategy_pinned = respect_config_pins and self.config.sanitization.strategy
         threshold_pinned = (
@@ -498,15 +570,59 @@ class ContextPolicyAnalyzerAgent(BaseAgent):
             and self.config.detection.confidence_threshold is not None
         )
         updates: Dict[str, object] = {}
+        params = dict(policy.detection_params)
+        params_changed = False
         if engine in DETECTION_TOOL_NAMES and not engine_pinned:
             updates["detection_engine"] = engine
+            if engine != policy.detection_engine:
+                current_threshold = params.get("confidence_threshold")
+                params = asdict(DETECTION_DEFAULT_PARAMS[engine])
+                if current_threshold is not None:
+                    params["confidence_threshold"] = current_threshold
+                params_changed = True
         if strategy in SANITIZATION_TOOL_NAMES and not strategy_pinned:
             updates["sanitization_strategy"] = strategy
         if threshold in THRESHOLD_LEVELS and not threshold_pinned:
-            params = dict(policy.detection_params)
             params["confidence_threshold"] = THRESHOLD_LEVELS[threshold]
+            params_changed = True
+        if params_changed:
             updates["detection_params"] = params
+        # Operator and rewrite instruction only apply under their own strategy
+        final = updates.get("sanitization_strategy", policy.sanitization_strategy)
+        if final == "presidio" and operator in PRESIDIO_OPERATOR_GUIDANCE:
+            updates["sanitization_params"] = {
+                "operator": operator,
+                "operator_params": self._operator_params(operator),
+            }
+        if final == "synthetic_rewrite":
+            prompt = _pin_rewrite_instruction(
+                policy.sanitizer_system_prompt, instruction
+            )
+            if prompt != policy.sanitizer_system_prompt:
+                updates["sanitizer_system_prompt"] = prompt
+        final_engine = updates.get("detection_engine", policy.detection_engine)
+        if final_engine == "llm":
+            detector_prompt = _pin_rewrite_instruction(
+                policy.detector_system_prompt, detection_instruction
+            )
+            if detector_prompt != policy.detector_system_prompt:
+                updates["detector_system_prompt"] = detector_prompt
         return replace(policy, **updates) if updates else policy
+
+    def _operator_params(self, operator: str) -> Dict[str, object]:
+        """Default params for a presidio operator."""
+        if operator == "mask":
+            return {"masking_char": "*", "chars_to_mask": 128, "from_end": False}
+        if operator == "encrypt":
+            key = self.config.sanitization.encryption_key
+            if not key:
+                key = secrets.token_hex(16)
+                logger.warning(
+                    "No sanitization.encryption_key configured: using an "
+                    "ephemeral key, encrypted values are unrecoverable."
+                )
+            return {"key": key}
+        return {}
 
     def _select_params(
         self, engine: str, query: str, chunks: List[str]
@@ -603,12 +719,24 @@ class ContextPolicyAnalyzerAgent(BaseAgent):
 
     def _escalate(self, state: PrivacyState, policy: PrivacyPolicy) -> PrivacyState:
         """Re-entry path: harden the policy from the adversary report or gate feedback."""
-        iteration = state.get("iteration", 0)
-        leak_iterations = state.get("leak_iterations", 0)
+        total_escalations = state.get("total_escalations", 0)
+        adversary_escalations = state.get("adversary_escalations", 0)
         verdict = state.get("verdict")
         trigger_vector, trigger_entity = None, None
         from_human_feedback = False
-        if verdict is not None and verdict.leaked:
+        if state.get("revision_requested"):
+            revision = total_escalations - adversary_escalations + 1
+            reason = f"Revision {revision}: acting on your feedback"
+            report = (state.get("human_feedback") or "").strip()
+            new_policy = self._apply_guidance(
+                state,
+                policy,
+                report,
+                note_label="Human guidance",
+                respect_config_pins=False,
+            )
+            from_human_feedback = bool(report)
+        elif verdict is not None and verdict.leaked:
             report = (verdict.recommendation or "").strip()
             new_policy = self._apply_guidance(
                 state,
@@ -618,36 +746,39 @@ class ContextPolicyAnalyzerAgent(BaseAgent):
                 respect_config_pins=True,
             )
             trigger_vector, trigger_entity = verdict.vector, verdict.entity_type
-            leak_iterations += 1  # only leak escalations count toward the budget
-        elif state.get("approved") is False:
-            report = (state.get("human_feedback") or "").strip()
-            new_policy = self._apply_guidance(
-                state,
-                policy,
-                report,
-                note_label="Human guidance",
-                respect_config_pins=False,
+            adversary_escalations += 1
+            budget = self.config.leakage_adversary.max_iterations
+            leaked = trigger_entity or "sensitive data"
+            vector = (
+                trigger_vector.value.replace("_", " ") if trigger_vector else "a probe"
             )
-            from_human_feedback = True
+            reason = (
+                f"Leak {adversary_escalations}/{budget}: the adversary recovered "
+                f"{leaked} via {vector} (confidence {verdict.confidence:.2f})"
+            )
         else:
-            raise ValueError("escalate called without a leak or rejection")
+            raise ValueError("escalate called without a leak or a revision")
         label = _describe_policy_changes(policy, new_policy)
         record = EscalationRecord(
-            iteration=iteration + 1,
+            iteration=total_escalations + 1,
             escalation=label,
             from_human_feedback=from_human_feedback,
             vector=trigger_vector,
             entity_type=trigger_entity,
             report=report or None,
         )
-        logger.info("Policy escalation %d: %s", iteration + 1, label)
+        notice = f"{reason} → retrying with {label}"
+        if not report_notice(notice):
+            logger.info("Privacy: %s", notice)
         return PrivacyState(
             policy=new_policy,
-            iteration=iteration + 1,
-            leak_iterations=leak_iterations,
+            total_escalations=total_escalations + 1,
+            adversary_escalations=adversary_escalations,
             escalation_log=list(state.get("escalation_log", [])) + [record],
             outcome=PreCloudOutcome.RE_LOOPED,
             human_feedback=None,  # was taken into account already
+            revision_requested=False,
+            skip_detection=_detection_unchanged(policy, new_policy),
         )
 
     def _node(self, state: PrivacyState) -> PrivacyState:
